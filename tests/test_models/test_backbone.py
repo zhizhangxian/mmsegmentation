@@ -4,7 +4,11 @@ from mmcv.ops import DeformConv2dPack
 from mmcv.utils.parrots_wrapper import _BatchNorm
 from torch.nn.modules import AvgPool2d, GroupNorm
 
-from mmseg.models.backbones import ResNet, ResNetV1d, ResNeXt
+from mmseg.models.backbones import (CGNet, FastSCNN, ResNeSt, ResNet,
+                                    ResNetV1d, ResNeXt)
+from mmseg.models.backbones.cgnet import (ContextGuidedBlock,
+                                          GlobalContextExtractor)
+from mmseg.models.backbones.resnest import Bottleneck as BottleneckS
 from mmseg.models.backbones.resnet import BasicBlock, Bottleneck
 from mmseg.models.backbones.resnext import Bottleneck as BottleneckX
 from mmseg.models.utils import ResLayer
@@ -47,7 +51,6 @@ def check_norm_state(modules, train_state):
 
 
 def test_resnet_basic_block():
-
     with pytest.raises(AssertionError):
         # Not implemented yet.
         dcn = dict(type='DCN', deform_groups=1, fallback_on_stride=False)
@@ -97,7 +100,6 @@ def test_resnet_basic_block():
 
 
 def test_resnet_bottleneck():
-
     with pytest.raises(AssertionError):
         # Style must be in ['pytorch', 'caffe']
         Bottleneck(64, 64, style='tensorflow')
@@ -664,3 +666,212 @@ def test_resnext_backbone():
     assert feat[1].shape == torch.Size([1, 512, 28, 28])
     assert feat[2].shape == torch.Size([1, 1024, 14, 14])
     assert feat[3].shape == torch.Size([1, 2048, 7, 7])
+
+
+def test_fastscnn_backbone():
+    with pytest.raises(AssertionError):
+        # Fast-SCNN channel constraints.
+        FastSCNN(
+            3, (32, 48),
+            64, (64, 96, 128), (2, 2, 1),
+            global_out_channels=127,
+            higher_in_channels=64,
+            lower_in_channels=128)
+
+    # Test FastSCNN Standard Forward
+    model = FastSCNN()
+    model.init_weights()
+    model.train()
+    batch_size = 4
+    imgs = torch.randn(batch_size, 3, 512, 1024)
+    feat = model(imgs)
+
+    assert len(feat) == 3
+    # higher-res
+    assert feat[0].shape == torch.Size([batch_size, 64, 64, 128])
+    # lower-res
+    assert feat[1].shape == torch.Size([batch_size, 128, 16, 32])
+    # FFM output
+    assert feat[2].shape == torch.Size([batch_size, 128, 64, 128])
+
+
+def test_resnest_bottleneck():
+    with pytest.raises(AssertionError):
+        # Style must be in ['pytorch', 'caffe']
+        BottleneckS(64, 64, radix=2, reduction_factor=4, style='tensorflow')
+
+    # Test ResNeSt Bottleneck structure
+    block = BottleneckS(
+        64, 256, radix=2, reduction_factor=4, stride=2, style='pytorch')
+    assert block.avd_layer.stride == 2
+    assert block.conv2.channels == 256
+
+    # Test ResNeSt Bottleneck forward
+    block = BottleneckS(64, 16, radix=2, reduction_factor=4)
+    x = torch.randn(2, 64, 56, 56)
+    x_out = block(x)
+    assert x_out.shape == torch.Size([2, 64, 56, 56])
+
+
+def test_resnest_backbone():
+    with pytest.raises(KeyError):
+        # ResNeSt depth should be in [50, 101, 152, 200]
+        ResNeSt(depth=18)
+
+    # Test ResNeSt with radix 2, reduction_factor 4
+    model = ResNeSt(
+        depth=50, radix=2, reduction_factor=4, out_indices=(0, 1, 2, 3))
+    model.init_weights()
+    model.train()
+
+    imgs = torch.randn(2, 3, 224, 224)
+    feat = model(imgs)
+    assert len(feat) == 4
+    assert feat[0].shape == torch.Size([2, 256, 56, 56])
+    assert feat[1].shape == torch.Size([2, 512, 28, 28])
+    assert feat[2].shape == torch.Size([2, 1024, 14, 14])
+    assert feat[3].shape == torch.Size([2, 2048, 7, 7])
+
+
+def test_cgnet_GlobalContextExtractor():
+    block = GlobalContextExtractor(16, 16, with_cp=True)
+    x = torch.randn(2, 16, 64, 64, requires_grad=True)
+    x_out = block(x)
+    assert x_out.shape == torch.Size([2, 16, 64, 64])
+
+
+def test_cgnet_context_guided_block():
+    with pytest.raises(AssertionError):
+        # cgnet ContextGuidedBlock GlobalContextExtractor channel and reduction
+        # constraints.
+        ContextGuidedBlock(8, 8)
+
+    # test cgnet ContextGuidedBlock with checkpoint forward
+    block = ContextGuidedBlock(
+        16, 16, act_cfg=dict(type='PReLU'), with_cp=True)
+    assert block.with_cp
+    x = torch.randn(2, 16, 64, 64, requires_grad=True)
+    x_out = block(x)
+    assert x_out.shape == torch.Size([2, 16, 64, 64])
+
+    # test cgnet ContextGuidedBlock without checkpoint forward
+    block = ContextGuidedBlock(32, 32)
+    assert not block.with_cp
+    x = torch.randn(3, 32, 32, 32)
+    x_out = block(x)
+    assert x_out.shape == torch.Size([3, 32, 32, 32])
+
+    # test cgnet ContextGuidedBlock with down sampling
+    block = ContextGuidedBlock(32, 32, downsample=True)
+    assert block.conv1x1.conv.in_channels == 32
+    assert block.conv1x1.conv.out_channels == 32
+    assert block.conv1x1.conv.kernel_size == (3, 3)
+    assert block.conv1x1.conv.stride == (2, 2)
+    assert block.conv1x1.conv.padding == (1, 1)
+
+    assert block.f_loc.in_channels == 32
+    assert block.f_loc.out_channels == 32
+    assert block.f_loc.kernel_size == (3, 3)
+    assert block.f_loc.stride == (1, 1)
+    assert block.f_loc.padding == (1, 1)
+    assert block.f_loc.groups == 32
+    assert block.f_loc.dilation == (1, 1)
+    assert block.f_loc.bias is None
+
+    assert block.f_sur.in_channels == 32
+    assert block.f_sur.out_channels == 32
+    assert block.f_sur.kernel_size == (3, 3)
+    assert block.f_sur.stride == (1, 1)
+    assert block.f_sur.padding == (2, 2)
+    assert block.f_sur.groups == 32
+    assert block.f_sur.dilation == (2, 2)
+    assert block.f_sur.bias is None
+
+    assert block.bottleneck.in_channels == 64
+    assert block.bottleneck.out_channels == 32
+    assert block.bottleneck.kernel_size == (1, 1)
+    assert block.bottleneck.stride == (1, 1)
+    assert block.bottleneck.bias is None
+
+    x = torch.randn(1, 32, 32, 32)
+    x_out = block(x)
+    assert x_out.shape == torch.Size([1, 32, 16, 16])
+
+    # test cgnet ContextGuidedBlock without down sampling
+    block = ContextGuidedBlock(32, 32, downsample=False)
+    assert block.conv1x1.conv.in_channels == 32
+    assert block.conv1x1.conv.out_channels == 16
+    assert block.conv1x1.conv.kernel_size == (1, 1)
+    assert block.conv1x1.conv.stride == (1, 1)
+    assert block.conv1x1.conv.padding == (0, 0)
+
+    assert block.f_loc.in_channels == 16
+    assert block.f_loc.out_channels == 16
+    assert block.f_loc.kernel_size == (3, 3)
+    assert block.f_loc.stride == (1, 1)
+    assert block.f_loc.padding == (1, 1)
+    assert block.f_loc.groups == 16
+    assert block.f_loc.dilation == (1, 1)
+    assert block.f_loc.bias is None
+
+    assert block.f_sur.in_channels == 16
+    assert block.f_sur.out_channels == 16
+    assert block.f_sur.kernel_size == (3, 3)
+    assert block.f_sur.stride == (1, 1)
+    assert block.f_sur.padding == (2, 2)
+    assert block.f_sur.groups == 16
+    assert block.f_sur.dilation == (2, 2)
+    assert block.f_sur.bias is None
+
+    x = torch.randn(1, 32, 32, 32)
+    x_out = block(x)
+    assert x_out.shape == torch.Size([1, 32, 32, 32])
+
+
+def test_cgnet_backbone():
+    with pytest.raises(AssertionError):
+        # check invalid num_channels
+        CGNet(num_channels=(32, 64, 128, 256))
+
+    with pytest.raises(AssertionError):
+        # check invalid num_blocks
+        CGNet(num_blocks=(3, 21, 3))
+
+    with pytest.raises(AssertionError):
+        # check invalid dilation
+        CGNet(num_blocks=2)
+
+    with pytest.raises(AssertionError):
+        # check invalid reduction
+        CGNet(reductions=16)
+
+    with pytest.raises(AssertionError):
+        # check invalid num_channels and reduction
+        CGNet(num_channels=(32, 64, 128), reductions=(64, 129))
+
+    # Test CGNet with default settings
+    model = CGNet()
+    model.init_weights()
+    model.train()
+
+    imgs = torch.randn(2, 3, 224, 224)
+    feat = model(imgs)
+    assert len(feat) == 3
+    assert feat[0].shape == torch.Size([2, 35, 112, 112])
+    assert feat[1].shape == torch.Size([2, 131, 56, 56])
+    assert feat[2].shape == torch.Size([2, 256, 28, 28])
+
+    # Test CGNet with norm_eval True and with_cp True
+    model = CGNet(norm_eval=True, with_cp=True)
+    with pytest.raises(TypeError):
+        # check invalid pretrained
+        model.init_weights(pretrained=8)
+    model.init_weights()
+    model.train()
+
+    imgs = torch.randn(2, 3, 224, 224)
+    feat = model(imgs)
+    assert len(feat) == 3
+    assert feat[0].shape == torch.Size([2, 35, 112, 112])
+    assert feat[1].shape == torch.Size([2, 131, 56, 56])
+    assert feat[2].shape == torch.Size([2, 256, 28, 28])
